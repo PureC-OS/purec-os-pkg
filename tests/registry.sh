@@ -92,5 +92,9 @@ check "Required refuses unsigned repository.conf" "! $PKG --root $ROOT --config 
 rm -f $T/repository.conf
 $P -Sy > $T/sy5.log 2>&1
 check "missing repository.conf keeps old entries" "grep -q 'not available' $T/sy5.log && test -f $ROOT/var/lib/pkg/sync/tpkg.src"
+printf '# empty\n' > $T/registry.conf
+mk emptyreg 1.0-1; mkdir -p $T/bin/emptyreg; cp $REL/emptyreg-1.0-1-x86_64.pkg.tar.gz $T/bin/emptyreg/
+printf 'emptyreg bin/emptyreg/emptyreg-1.0-1-x86_64.pkg.tar.gz\n' > $T/repository.conf
+check "empty registry.conf works with repository.conf" "$P -Sy > $T/sy6.log 2>&1 && grep -q 'emptyreg 1.0-1' $T/sy6.log && $P -S emptyreg >/dev/null 2>&1 && test -f $ROOT/usr/share/emptyreg.txt"
 echo "RESULT fails=$fail dir=$T"
 exit $fail

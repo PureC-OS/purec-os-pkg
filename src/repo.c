@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_SOURCES 128
@@ -696,13 +697,22 @@ static int src_field(const char *path, const char *key, char *out, size_t cap)
     return found;
 }
 
+static void fresh_url(const char *url, int signature, char *out, size_t cap)
+{
+    if (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8))
+        snprintf(out, cap, "%s%s?nocache=%lld", url, signature ? ".sig" : "", (long long)time(NULL));
+    else
+        snprintf(out, cap, "%s%s", url, signature ? ".sig" : "");
+}
+
 static int download_signed(const char *url, const char *dest, const char *label, int optional)
 {
-    char fresh[PKG_PATH_MAX + 40], sig[PKG_PATH_MAX + 48], sigurl[PKG_PATH_MAX + 72];
+    char fresh[PKG_PATH_MAX + 40], sig[PKG_PATH_MAX + 48], sigurl[PKG_PATH_MAX + 96], geturl[PKG_PATH_MAX + 96];
     snprintf(fresh, sizeof(fresh), "%s.new", dest);
     snprintf(sig, sizeof(sig), "%s.sig", fresh);
-    snprintf(sigurl, sizeof(sigurl), "%s.sig", url);
-    if (curl_get(url, fresh, 0, optional ? CURL_SILENT : 1) < 0) {
+    fresh_url(url, 1, sigurl, sizeof(sigurl));
+    fresh_url(url, 0, geturl, sizeof(geturl));
+    if (curl_get(geturl, fresh, 0, optional ? CURL_SILENT : 1) < 0) {
         unlink(fresh);
         if (optional) {
             printf("not available\n");
@@ -856,7 +866,7 @@ int sync_refresh(void)
     char keep_config[PKG_PATH_MAX];
     snprintf(keep_config, sizeof(keep_config), "%s", config_used);
     config_load();
-    if (!sources_total)
+    if (!sources_total && !registry[0])
         die("no repositories: set Registry in %s", keep_config[0] ? keep_config : rp("etc/pkg/pkg.conf"));
     if (locals_ignored)
         warn("%d repositories in [trusted] are ignored, set AllowLocalRepos = yes to use them", locals_ignored);
