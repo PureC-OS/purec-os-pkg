@@ -389,7 +389,7 @@ static int registry_where(char *base, size_t bcap, char *repo, size_t rcap)
     }
     if (parse_github(registry, owner_repo, sizeof(owner_repo)) < 0)
         return -1;
-    snprintf(base, bcap, "https://raw.githubusercontent.com/%s/HEAD/", owner_repo);
+    snprintf(base, bcap, "https://raw.githubusercontent.com/%s/main/", owner_repo);
     snprintf(repo, rcap, "%s", owner_repo);
     return 0;
 }
@@ -753,7 +753,7 @@ static int fetch_registry(void)
     if (!strncmp(registry, "file://", 7) || registry[0] == '/' || ends_with(registry, ".conf"))
         snprintf(url, sizeof(url), "%s", registry);
     else if (parse_github(registry, owner_repo, sizeof(owner_repo)) == 0)
-        snprintf(url, sizeof(url), "https://raw.githubusercontent.com/%s/HEAD/" REGISTRY_FILE, owner_repo);
+        snprintf(url, sizeof(url), "https://raw.githubusercontent.com/%s/main/" REGISTRY_FILE, owner_repo);
     else
         die("Registry = %s is neither a GitHub repository nor a .conf address", registry);
     char dest[PKG_PATH_MAX + 32];
