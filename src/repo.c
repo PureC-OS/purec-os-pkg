@@ -254,17 +254,16 @@ void config_load(void)
     load_file(rp("etc/pkg.conf"), 0);
 }
 
-static int curl_get(const char *url, const char *dest, int api, int quiet)
+#define CURL_QUIET 1
+#define CURL_SILENT 2
+
+static int curl_run(const char *url, const char *dest, int api, int mode, const char *headers, const char *etag,
+                    int follow)
 {
-    if (!strncmp(url, "file://", 7) || url[0] == '/')
-        return copy_file(url[0] == '/' ? url : url + 7, dest);
-    char tmp[PKG_PATH_MAX + 16];
-    snprintf(tmp, sizeof(tmp), "%s.part", dest);
-    unlink(tmp);
-    char *argv[24];
+    char *argv[32];
     int n = 0;
     argv[n++] = "curl";
-    argv[n++] = "-fL";
+    argv[n++] = follow ? "-fL" : "-f";
     argv[n++] = "--retry";
     argv[n++] = "2";
     argv[n++] = "--connect-timeout";
@@ -273,22 +272,97 @@ static int curl_get(const char *url, const char *dest, int api, int quiet)
     argv[n++] = "1024";
     argv[n++] = "--speed-time";
     argv[n++] = "60";
-    argv[n++] = (!quiet && isatty(1)) ? "-#" : "-sS";
+    argv[n++] = mode == CURL_SILENT ? "-s" : (!mode && isatty(1)) ? "-#" : "-sS";
     if (api) {
         argv[n++] = "-H";
         argv[n++] = "Accept: application/vnd.github+json";
         argv[n++] = "-H";
         argv[n++] = "X-GitHub-Api-Version: 2022-11-28";
     }
+    if (headers) {
+        argv[n++] = "-D";
+        argv[n++] = (char *)headers;
+    }
+    if (etag && path_exists(etag)) {
+        argv[n++] = "--etag-compare";
+        argv[n++] = (char *)etag;
+    }
     argv[n++] = "-o";
-    argv[n++] = tmp;
+    argv[n++] = (char *)dest;
     argv[n++] = (char *)url;
     argv[n] = NULL;
-    if (run_argv(argv) != 0 || rename(tmp, dest) < 0) {
+    return run_argv(argv);
+}
+
+static int curl_get(const char *url, const char *dest, int api, int mode)
+{
+    if (!strncmp(url, "file://", 7) || url[0] == '/')
+        return copy_file(url[0] == '/' ? url : url + 7, dest);
+    char tmp[PKG_PATH_MAX + 16];
+    snprintf(tmp, sizeof(tmp), "%s.part", dest);
+    unlink(tmp);
+    if (curl_run(url, tmp, api, mode, NULL, NULL, 1) != 0 || rename(tmp, dest) < 0) {
         unlink(tmp);
         return -1;
     }
     return 0;
+}
+
+static int header_status(const char *headers)
+{
+    char *text = read_text_file(headers, NULL);
+    if (!text)
+        return 0;
+    int status = 0;
+    for (char *line = text; line && *line;) {
+        char *next = strchr(line, '\n');
+        if (!strncmp(line, "HTTP/", 5)) {
+            char *sp = strchr(line, ' ');
+            if (sp)
+                status = atoi(sp + 1);
+        }
+        line = next ? next + 1 : NULL;
+    }
+    free(text);
+    return status;
+}
+
+static int header_value(const char *headers, const char *key, char *out, size_t cap)
+{
+    char *text = read_text_file(headers, NULL);
+    if (!text)
+        return -1;
+    int found = -1;
+    size_t klen = strlen(key);
+    for (char *line = text; line && *line;) {
+        char *next = strchr(line, '\n');
+        if (next)
+            *next = '\0';
+        if (!strncasecmp(line, key, klen) && line[klen] == ':') {
+            char *v = line + klen + 1;
+            while (*v == ' ')
+                v++;
+            size_t len = strcspn(v, "\r");
+            if (len + 1 <= cap) {
+                memcpy(out, v, len);
+                out[len] = '\0';
+                found = 0;
+            }
+        }
+        line = next ? next + 1 : NULL;
+    }
+    free(text);
+    return found;
+}
+
+static void cache_name(const struct source *src, const char *ext, char *out, size_t cap)
+{
+    char flat[96];
+    snprintf(flat, sizeof(flat), "%s", src->owner_repo);
+    for (char *c = flat; *c; c++)
+        if (*c == '/')
+            *c = '_';
+    snprintf(out, cap, "%s/%s.%s", rp("var/lib/pkg/sync/cache"), flat, ext);
 }
 
 static int ends_with(const char *s, const char *suffix)
@@ -341,6 +415,35 @@ struct found {
     uint64_t size;
 };
 
+static void add_found(struct found *table, int *count, const char *aname, const char *tag, const char *desc,
+                      const char *url, const char *sig, uint64_t size)
+{
+    char name[PKG_NAME_MAX], version[PKG_VERSION_MAX];
+    if (parse_asset(aname, name, sizeof(name), version, sizeof(version)) < 0)
+        return;
+    int slot = -1;
+    for (int i = 0; i < *count; i++)
+        if (!strcmp(table[i].name, name))
+            slot = i;
+    if (slot >= 0 && pkg_vercmp(version, table[slot].version) <= 0)
+        return;
+    if (slot < 0) {
+        if (*count == MAX_PER_REPO)
+            return;
+        slot = (*count)++;
+    }
+    struct found *f = &table[slot];
+    memset(f, 0, sizeof(*f));
+    snprintf(f->name, sizeof(f->name), "%s", name);
+    snprintf(f->version, sizeof(f->version), "%s", version);
+    snprintf(f->tag, sizeof(f->tag), "%s", tag);
+    snprintf(f->asset, sizeof(f->asset), "%s", aname);
+    snprintf(f->desc, sizeof(f->desc), "%s", desc);
+    snprintf(f->url, sizeof(f->url), "%s", url);
+    snprintf(f->sig, sizeof(f->sig), "%s", sig);
+    f->size = size;
+}
+
 static void scan_release(const char *release, struct found *table, int *count)
 {
     const char *v;
@@ -358,35 +461,14 @@ static void scan_release(const char *release, struct found *table, int *count)
         json_string(v, relname, sizeof(relname));
     const char *cursor = assets, *asset;
     while (json_array_next(&cursor, &asset) == 1) {
-        char aname[PKG_FILENAME_MAX], name[PKG_NAME_MAX], version[PKG_VERSION_MAX];
+        char aname[PKG_FILENAME_MAX], url[PKG_PATH_MAX] = "", sig[PKG_PATH_MAX] = "";
         const char *nv = json_get(asset, "name");
         if (!nv || json_string(nv, aname, sizeof(aname)) < 0)
             continue;
-        if (parse_asset(aname, name, sizeof(name), version, sizeof(version)) < 0)
-            continue;
-        int slot = -1;
-        for (int i = 0; i < *count; i++)
-            if (!strcmp(table[i].name, name))
-                slot = i;
-        if (slot >= 0 && pkg_vercmp(version, table[slot].version) <= 0)
-            continue;
-        if (slot < 0) {
-            if (*count == MAX_PER_REPO)
-                continue;
-            slot = (*count)++;
-        }
-        struct found *f = &table[slot];
-        memset(f, 0, sizeof(*f));
-        snprintf(f->name, sizeof(f->name), "%s", name);
-        snprintf(f->version, sizeof(f->version), "%s", version);
-        snprintf(f->tag, sizeof(f->tag), "%s", tag);
-        snprintf(f->asset, sizeof(f->asset), "%s", aname);
-        snprintf(f->desc, sizeof(f->desc), "%s", relname);
         const char *uv = json_get(asset, "browser_download_url");
         if (uv)
-            json_string(uv, f->url, sizeof(f->url));
+            json_string(uv, url, sizeof(url));
         const char *sv = json_get(asset, "size");
-        f->size = sv ? (uint64_t)json_number(sv) : 0;
         char signame[PKG_FILENAME_MAX + 8];
         snprintf(signame, sizeof(signame), "%s.sig", aname);
         const char *c2 = assets, *a2;
@@ -397,23 +479,15 @@ static void scan_release(const char *release, struct found *table, int *count)
                 continue;
             const char *u2 = json_get(a2, "browser_download_url");
             if (u2)
-                json_string(u2, f->sig, sizeof(f->sig));
+                json_string(u2, sig, sizeof(sig));
         }
+        add_found(table, count, aname, tag, relname, url, sig, sv ? (uint64_t)json_number(sv) : 0);
     }
 }
 
-static int query_source(const struct source *src, struct found *table, int *count, char *why, size_t why_cap)
+static int parse_releases(const char *path, struct found *table, int *count, char *why, size_t why_cap)
 {
-    *count = 0;
-    char url[PKG_PATH_MAX + 128], dest[PKG_PATH_MAX];
-    snprintf(dest, sizeof(dest), "%s/releases.json", rp("var/lib/pkg/sync"));
-    snprintf(url, sizeof(url), "%s/repos/%s/releases?per_page=30", api_base, src->owner_repo);
-    if (curl_get(url, dest, 1, 1) < 0) {
-        snprintf(why, why_cap, "cannot reach %s", src->url);
-        return -1;
-    }
-    char *text = read_text_file(dest, NULL);
-    unlink(dest);
+    char *text = read_text_file(path, NULL);
     if (!text) {
         snprintf(why, why_cap, "empty answer");
         return -1;
@@ -428,7 +502,7 @@ static int query_source(const struct source *src, struct found *table, int *coun
         }
     } else {
         char message[200] = "unexpected answer";
-        const char *m = json_get(p, "message");
+        const char *m = p ? json_get(p, "message") : NULL;
         if (m)
             json_string(m, message, sizeof(message));
         snprintf(why, why_cap, "GitHub: %s", message);
@@ -436,6 +510,120 @@ static int query_source(const struct source *src, struct found *table, int *coun
         return -1;
     }
     free(text);
+    return releases;
+}
+
+static int query_html(const struct source *src, struct found *table, int *count, char *why, size_t why_cap)
+{
+    char headers[PKG_PATH_MAX + 32], page[PKG_PATH_MAX + 32], url[PKG_PATH_MAX + 128], location[PKG_PATH_MAX];
+    snprintf(headers, sizeof(headers), "%s/latest.hdr", rp("var/lib/pkg/sync/cache"));
+    snprintf(page, sizeof(page), "%s/assets.html", rp("var/lib/pkg/sync/cache"));
+    snprintf(url, sizeof(url), "https://github.com/%s/releases/latest", src->owner_repo);
+    unlink(headers);
+    curl_run(url, "/dev/null", 0, CURL_SILENT, headers, NULL, 0);
+    int status = header_status(headers);
+    int have = header_value(headers, "location", location, sizeof(location)) == 0;
+    unlink(headers);
+    if (!status) {
+        snprintf(why, why_cap, "cannot reach %s", src->url);
+        return -1;
+    }
+    const char *mark = have ? strstr(location, "/releases/tag/") : NULL;
+    if (!mark) {
+        snprintf(why, why_cap, status == 404 ? "repository not found" : "no releases");
+        return status == 404 ? -1 : 0;
+    }
+    char tag[64];
+    snprintf(tag, sizeof(tag), "%s", mark + strlen("/releases/tag/"));
+    snprintf(url, sizeof(url), "https://github.com/%s/releases/expanded_assets/%s", src->owner_repo, tag);
+    if (curl_get(url, page, 0, CURL_QUIET) < 0) {
+        snprintf(why, why_cap, "cannot read the release %s", tag);
+        return -1;
+    }
+    char *html = read_text_file(page, NULL);
+    unlink(page);
+    if (!html) {
+        snprintf(why, why_cap, "empty answer");
+        return -1;
+    }
+    char prefix[PKG_PATH_MAX];
+    snprintf(prefix, sizeof(prefix), "/%s/releases/download/%s/", src->owner_repo, tag);
+    size_t plen = strlen(prefix);
+    for (const char *c = strstr(html, prefix); c; c = strstr(c + 1, prefix)) {
+        const char *aname = c + plen;
+        size_t len = strcspn(aname, "\"'<> ");
+        if (!len || len >= PKG_FILENAME_MAX)
+            continue;
+        char asset[PKG_FILENAME_MAX], sigpath[PKG_PATH_MAX + 8], full[PKG_PATH_MAX + 32], sig[PKG_PATH_MAX + 40] = "";
+        memcpy(asset, aname, len);
+        asset[len] = '\0';
+        if (!ends_with(asset, ".pkg.tar.gz"))
+            continue;
+        snprintf(sigpath, sizeof(sigpath), "%s%s.sig\"", prefix, asset);
+        snprintf(full, sizeof(full), "https://github.com%s%s", prefix, asset);
+        if (strstr(html, sigpath))
+            snprintf(sig, sizeof(sig), "%s.sig", full);
+        add_found(table, count, asset, tag, "", full, sig, 0);
+    }
+    free(html);
+    return 1;
+}
+
+static int query_source(const struct source *src, struct found *table, int *count, char *why, size_t why_cap)
+{
+    *count = 0;
+    char url[PKG_PATH_MAX + 128];
+    snprintf(url, sizeof(url), "%s/repos/%s/releases?per_page=30", api_base, src->owner_repo);
+    int releases;
+    if (!strncmp(api_base, "file://", 7) || api_base[0] == '/') {
+        char dest[PKG_PATH_MAX];
+        snprintf(dest, sizeof(dest), "%s/releases.json", rp("var/lib/pkg/sync"));
+        if (curl_get(url, dest, 1, CURL_QUIET) < 0) {
+            snprintf(why, why_cap, "cannot reach %s", src->url);
+            return -1;
+        }
+        releases = parse_releases(dest, table, count, why, why_cap);
+        unlink(dest);
+    } else {
+        mkdirs(rp("var/lib/pkg/sync/cache"), 0755);
+        char json[PKG_PATH_MAX + 128], etag[PKG_PATH_MAX + 128], part[PKG_PATH_MAX + 140], headers[PKG_PATH_MAX + 140];
+        cache_name(src, "json", json, sizeof(json));
+        cache_name(src, "etag", etag, sizeof(etag));
+        snprintf(part, sizeof(part), "%s.part", json);
+        snprintf(headers, sizeof(headers), "%s.hdr", json);
+        unlink(part);
+        unlink(headers);
+        if (!path_exists(json))
+            unlink(etag);
+        curl_run(url, part, 1, CURL_SILENT, headers, etag, 1);
+        int status = header_status(headers);
+        char value[200];
+        if (status == 200 && path_exists(part)) {
+            rename(part, json);
+            if (header_value(headers, "etag", value, sizeof(value)) == 0) {
+                strcat(value, "\n");
+                write_text_file(etag, value, strlen(value));
+            } else {
+                unlink(etag);
+            }
+        }
+        int limited = (status == 403 || status == 429) &&
+                      header_value(headers, "x-ratelimit-remaining", value, sizeof(value)) == 0 && atoi(value) == 0;
+        unlink(part);
+        unlink(headers);
+        if (status == 200 || status == 304) {
+            releases = parse_releases(json, table, count, why, why_cap);
+        } else {
+            int rc = query_html(src, table, count, why, why_cap);
+            if (rc < 0 && limited)
+                snprintf(why, why_cap, "GitHub API limit reached and %s is unreachable", "github.com");
+            if (rc <= 0)
+                return rc < 0 ? -1 : 1;
+            releases = 1;
+        }
+    }
+    if (releases < 0)
+        return -1;
     if (!*count) {
         if (!releases)
             snprintf(why, why_cap, "no releases");
@@ -510,7 +698,7 @@ static int fetch_registry(void)
         return -1;
     }
     if (siglevel != SIG_NEVER) {
-        int have_sig = curl_get(sigurl, sig, 0, 1) == 0;
+        int have_sig = curl_get(sigurl, sig, 0, CURL_SILENT) == 0;
         if (have_sig) {
             int rc = sig_verify_file(fresh, sig);
             unlink(sig);
