@@ -705,6 +705,62 @@ static void fresh_url(const char *url, int signature, char *out, size_t cap)
         snprintf(out, cap, "%s%s", url, signature ? ".sig" : "");
 }
 
+static int hex_value(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+static int verify_embedded(const char *path)
+{
+    size_t length = 0;
+    char *text = read_text_file(path, &length);
+    if (!text)
+        return 1;
+    size_t end = length;
+    while (end && (text[end - 1] == '\n' || text[end - 1] == '\r' || text[end - 1] == ' '))
+        end--;
+    size_t start = end;
+    while (start && text[start - 1] != '\n')
+        start--;
+    if (end - start < 6 || strncmp(text + start, "#sig ", 5) != 0) {
+        free(text);
+        return 1;
+    }
+    size_t digits = end - start - 5;
+    unsigned char *der = malloc(digits / 2 + 1);
+    size_t der_len = 0;
+    int rc = SIG_BAD;
+    if (der && digits % 2 == 0) {
+        int valid = 1;
+        for (size_t i = 0; i < digits; i += 2) {
+            int hi = hex_value(text[start + 5 + i]), lo = hex_value(text[start + 6 + i]);
+            if (hi < 0 || lo < 0) {
+                valid = 0;
+                break;
+            }
+            der[der_len++] = (unsigned char)(hi * 16 + lo);
+        }
+        if (valid) {
+            char payload[PKG_PATH_MAX + 16], esig[PKG_PATH_MAX + 16];
+            snprintf(payload, sizeof(payload), "%s.payload", path);
+            snprintf(esig, sizeof(esig), "%s.esig", path);
+            if (write_text_file(payload, text, start) == 0 && write_text_file(esig, der, der_len) == 0)
+                rc = sig_verify_file(payload, esig);
+            unlink(payload);
+            unlink(esig);
+        }
+    }
+    free(der);
+    free(text);
+    return rc;
+}
+
 static int download_signed(const char *url, const char *dest, const char *label, int optional)
 {
     char fresh[PKG_PATH_MAX + 40], sig[PKG_PATH_MAX + 48], sigurl[PKG_PATH_MAX + 96], geturl[PKG_PATH_MAX + 96];
@@ -723,10 +779,18 @@ static int download_signed(const char *url, const char *dest, const char *label,
         return -1;
     }
     if (siglevel != SIG_NEVER) {
-        int have_sig = curl_get(sigurl, sig, 0, CURL_SILENT) == 0;
+        int embedded = verify_embedded(fresh);
+        int have_sig = 0, rc = embedded;
+        if (embedded == 1) {
+            have_sig = curl_get(sigurl, sig, 0, CURL_SILENT) == 0;
+            if (have_sig) {
+                rc = sig_verify_file(fresh, sig);
+                unlink(sig);
+            }
+        } else {
+            have_sig = 1;
+        }
         if (have_sig) {
-            int rc = sig_verify_file(fresh, sig);
-            unlink(sig);
             if (rc == SIG_BAD || (rc == SIG_NOKEYS && siglevel == SIG_REQUIRED)) {
                 printf("failed\n");
                 warn("the %s signature is %s, keeping the last copy", label,

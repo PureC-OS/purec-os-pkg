@@ -96,5 +96,21 @@ printf '# empty\n' > $T/registry.conf
 mk emptyreg 1.0-1; mkdir -p $T/bin/emptyreg; cp $REL/emptyreg-1.0-1-x86_64.pkg.tar.gz $T/bin/emptyreg/
 printf 'emptyreg bin/emptyreg/emptyreg-1.0-1-x86_64.pkg.tar.gz\n' > $T/repository.conf
 check "empty registry.conf works with repository.conf" "$P -Sy > $T/sy6.log 2>&1 && grep -q 'emptyreg 1.0-1' $T/sy6.log && $P -S emptyreg >/dev/null 2>&1 && test -f $ROOT/usr/share/emptyreg.txt"
+KEYDIR=$T/keys; mkdir -p $KEYDIR $T/sroot/etc/pkg/keys $T/sreg
+python3 $MK/pkgsign.py genkey $KEYDIR/k.pem $KEYDIR/k.pub >/dev/null 2>&1
+cp $KEYDIR/k.pub $T/sroot/etc/pkg/keys/test.pub
+mk signed 1.0-1
+printf '# empty\n' > $T/sreg/registry.conf
+python3 $MK/publish.py --registry $T/sreg --key $KEYDIR/k.pem $REL/signed-1.0-1-x86_64.pkg.tar.gz >/dev/null 2>&1
+printf '[options]\nSigLevel = Required\nRegistry = file://%s/registry.conf\n' $T/sreg > $T/spkg.conf
+SP="$PKG --root $T/sroot --config $T/spkg.conf --noconfirm"
+check "embedded signature accepted with Required" "$SP -Sy > $T/ss1.log 2>&1 && grep -q 'signed 1.0-1' $T/ss1.log"
+check "embedded signature: no .sig file needed" "! test -f $T/sreg/repository.conf.sig && ! test -f $T/sreg/registry.conf.sig"
+check "signed package installs" "$SP -S signed >/dev/null 2>&1 && test -f $T/sroot/usr/share/signed.txt"
+sed -i 's/^signed /signed2 /' $T/sreg/repository.conf
+check "tampered repository.conf refused" "! $SP -Sy > $T/ss2.log 2>&1 && grep -q 'signature is invalid' $T/ss2.log"
+rm -f $T/sreg/repository.conf
+printf 'signed bin/signed/signed-1.0-1-x86_64.pkg.tar.gz\n' > $T/sreg/repository.conf
+check "unsigned repository.conf refused with Required" "! $SP -Sy > $T/ss3.log 2>&1 && grep -q 'no signature' $T/ss3.log"
 echo "RESULT fails=$fail dir=$T"
 exit $fail
