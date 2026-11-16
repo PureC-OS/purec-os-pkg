@@ -100,6 +100,7 @@ KEYDIR=$T/keys; mkdir -p $KEYDIR $T/sroot/etc/pkg/keys $T/sreg
 python3 $MK/pkgsign.py genkey $KEYDIR/k.pem $KEYDIR/k.pub >/dev/null 2>&1
 cp $KEYDIR/k.pub $T/sroot/etc/pkg/keys/test.pub
 mk signed 1.0-1
+python3 $MK/pkgsign.py sign $KEYDIR/k.pem $REL/signed-1.0-1-x86_64.pkg.tar.gz $REL/signed-1.0-1-x86_64.pkg.tar.gz.sig >/dev/null 2>&1
 printf '# empty\n' > $T/sreg/registry.conf
 python3 $MK/publish.py --registry $T/sreg --key $KEYDIR/k.pem $REL/signed-1.0-1-x86_64.pkg.tar.gz >/dev/null 2>&1
 printf '[options]\nSigLevel = Required\nRegistry = file://%s/registry.conf\n' $T/sreg > $T/spkg.conf
