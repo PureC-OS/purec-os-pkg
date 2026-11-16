@@ -11,7 +11,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#define PKG_VERSION_TEXT "pkg 1.0"
+#ifndef PKG_VERSION_TEXT
+#define PKG_VERSION_TEXT "pkg"
+#endif
 
 static int lock_held;
 
