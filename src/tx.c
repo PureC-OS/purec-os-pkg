@@ -503,8 +503,12 @@ static int install_item(struct item *it)
         scan_free(&scan);
         return -1;
     }
-    if (have_old && strcmp(old_info.version, info.version) != 0)
-        localdb_remove(&old_info);
+    if (have_old) {
+        char olddir[PKG_PATH_MAX + 128];
+        localdb_dir(&old_info, olddir, sizeof(olddir));
+        if (strcmp(olddir, dbdir) != 0)
+            localdb_remove(&old_info);
+    }
     owners_invalidate();
 
     char script[PKG_PATH_MAX + 200];

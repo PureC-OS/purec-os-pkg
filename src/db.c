@@ -25,7 +25,10 @@ static const char *local_root(void)
 
 const char *localdb_dir(const struct pkg_info *p, char *out, size_t cap)
 {
-    snprintf(out, cap, "%s/%s-%s", local_root(), p->name, p->version);
+    if (p->dbdir[0])
+        snprintf(out, cap, "%s/%s", local_root(), p->dbdir);
+    else
+        snprintf(out, cap, "%s/%s-%s", local_root(), p->name, p->version);
     return out;
 }
 
@@ -62,6 +65,7 @@ void localdb_load(void)
         free(text);
         if (rc < 0)
             continue;
+        snprintf(info.dbdir, sizeof(info.dbdir), "%s", e->d_name);
         if (ldb.count == ldb.cap) {
             int cap = ldb.cap ? ldb.cap * 2 : 64;
             struct pkg_info *grown = realloc(ldb.pkgs, (size_t)cap * sizeof(*grown));

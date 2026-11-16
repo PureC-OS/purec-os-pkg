@@ -36,6 +36,7 @@ struct pkg_info {
     char sha512[PKG_HASH_HEX];
     long installdate;
     int reason;
+    char dbdir[96];
 };
 
 struct pkg_entry {
