@@ -15,6 +15,7 @@
 #define SIG_OPTIONAL 1
 #define SIG_REQUIRED 2
 #define REGISTRY_FILE "registry.conf"
+#define REPOSITORY_FILE "repository.conf"
 
 struct source {
     char url[PKG_PATH_MAX];
@@ -371,6 +372,27 @@ static int ends_with(const char *s, const char *suffix)
     return a >= b && !strcmp(s + a - b, suffix);
 }
 
+static int registry_where(char *base, size_t bcap, char *repo, size_t rcap)
+{
+    if (!registry[0])
+        return -1;
+    char owner_repo[96];
+    if (!strncmp(registry, "file://", 7) || registry[0] == '/' || ends_with(registry, ".conf")) {
+        snprintf(base, bcap, "%s", registry);
+        char *slash = strrchr(base, '/');
+        if (!slash)
+            return -1;
+        slash[1] = '\0';
+        snprintf(repo, rcap, "registry");
+        return 0;
+    }
+    if (parse_github(registry, owner_repo, sizeof(owner_repo)) < 0)
+        return -1;
+    snprintf(base, bcap, "https://raw.githubusercontent.com/%s/HEAD/", owner_repo);
+    snprintf(repo, rcap, "%s", owner_repo);
+    return 0;
+}
+
 static int parse_asset(const char *asset, char *name, size_t ncap, char *version, size_t vcap)
 {
     char suffix[40];
@@ -674,6 +696,45 @@ static int src_field(const char *path, const char *key, char *out, size_t cap)
     return found;
 }
 
+static int download_signed(const char *url, const char *dest, const char *label, int optional)
+{
+    char fresh[PKG_PATH_MAX + 40], sig[PKG_PATH_MAX + 48], sigurl[PKG_PATH_MAX + 72];
+    snprintf(fresh, sizeof(fresh), "%s.new", dest);
+    snprintf(sig, sizeof(sig), "%s.sig", fresh);
+    snprintf(sigurl, sizeof(sigurl), "%s.sig", url);
+    if (curl_get(url, fresh, 0, optional ? CURL_SILENT : 1) < 0) {
+        unlink(fresh);
+        if (optional) {
+            printf("not available\n");
+            return 1;
+        }
+        printf("failed\n");
+        warn("cannot download the %s %s, using the last copy", label, url);
+        return -1;
+    }
+    if (siglevel != SIG_NEVER) {
+        int have_sig = curl_get(sigurl, sig, 0, CURL_SILENT) == 0;
+        if (have_sig) {
+            int rc = sig_verify_file(fresh, sig);
+            unlink(sig);
+            if (rc == SIG_BAD || (rc == SIG_NOKEYS && siglevel == SIG_REQUIRED)) {
+                printf("failed\n");
+                warn("the %s signature is %s, keeping the last copy", label,
+                     rc == SIG_BAD ? "invalid" : "not checkable (no keys)");
+                unlink(fresh);
+                return -1;
+            }
+        } else if (siglevel == SIG_REQUIRED) {
+            printf("failed\n");
+            warn("the %s has no signature, SigLevel = Required", label);
+            unlink(fresh);
+            return -1;
+        }
+    }
+    rename(fresh, dest);
+    return 0;
+}
+
 static int fetch_registry(void)
 {
     if (!registry[0])
@@ -685,39 +746,105 @@ static int fetch_registry(void)
         snprintf(url, sizeof(url), "https://raw.githubusercontent.com/%s/HEAD/" REGISTRY_FILE, owner_repo);
     else
         die("Registry = %s is neither a GitHub repository nor a .conf address", registry);
-    char dest[PKG_PATH_MAX + 32], fresh[PKG_PATH_MAX + 40], sig[PKG_PATH_MAX + 48], sigurl[PKG_PATH_MAX + 72];
+    char dest[PKG_PATH_MAX + 32];
     snprintf(dest, sizeof(dest), "%s/" REGISTRY_FILE, rp("var/lib/pkg/sync"));
-    snprintf(fresh, sizeof(fresh), "%s.new", dest);
-    snprintf(sig, sizeof(sig), "%s.sig", fresh);
-    snprintf(sigurl, sizeof(sigurl), "%s.sig", url);
     printf(" %-36s ", "registry");
     fflush(stdout);
-    if (curl_get(url, fresh, 0, 1) < 0) {
-        printf("failed\n");
-        warn("cannot download the registry %s, using the last copy", url);
+    if (download_signed(url, dest, "registry", 0) < 0)
         return -1;
-    }
-    if (siglevel != SIG_NEVER) {
-        int have_sig = curl_get(sigurl, sig, 0, CURL_SILENT) == 0;
-        if (have_sig) {
-            int rc = sig_verify_file(fresh, sig);
-            unlink(sig);
-            if (rc == SIG_BAD || (rc == SIG_NOKEYS && siglevel == SIG_REQUIRED)) {
-                printf("failed\n");
-                warn("the registry signature is %s, keeping the last copy",
-                     rc == SIG_BAD ? "invalid" : "not checkable (no keys)");
-                unlink(fresh);
-                return -1;
-            }
-        } else if (siglevel == SIG_REQUIRED) {
-            printf("failed\n");
-            warn("the registry has no signature, SigLevel = Required");
-            unlink(fresh);
-            return -1;
-        }
-    }
-    rename(fresh, dest);
     printf("done\n");
+    return 0;
+}
+
+static char sync_written[MAX_SOURCES * 4][PKG_NAME_MAX];
+static int sync_written_count;
+
+static int sync_repository(int *fresh)
+{
+    *fresh = 0;
+    char base[PKG_PATH_MAX], repo[96];
+    if (registry_where(base, sizeof(base), repo, sizeof(repo)) < 0)
+        return 0;
+    char url[PKG_PATH_MAX + 32], dest[PKG_PATH_MAX + 32];
+    snprintf(url, sizeof(url), "%s" REPOSITORY_FILE, base);
+    snprintf(dest, sizeof(dest), "%s/" REPOSITORY_FILE, rp("var/lib/pkg/sync"));
+    printf(" %-36s ", REPOSITORY_FILE);
+    fflush(stdout);
+    int rc = download_signed(url, dest, REPOSITORY_FILE, 1);
+    if (rc < 0)
+        return -1;
+    *fresh = rc == 0;
+    char *text = read_text_file(dest, NULL);
+    if (!text) {
+        if (rc == 0)
+            printf("empty\n");
+        return 0;
+    }
+    struct source tsrc;
+    memset(&tsrc, 0, sizeof(tsrc));
+    snprintf(tsrc.owner_repo, sizeof(tsrc.owner_repo), "%s", repo);
+    int shown = 0, lineno = 0;
+    for (char *line = text; line && *line;) {
+        char *eol = strchr(line, '\n');
+        if (eol)
+            *eol = '\0';
+        lineno++;
+        char *next = eol ? eol + 1 : NULL;
+        char *s = strip(line);
+        line = next;
+        if (!*s || *s == '#')
+            continue;
+        char *name = s, *p = s;
+        while (*p && *p != ' ' && *p != '\t')
+            p++;
+        if (*p)
+            *p++ = '\0';
+        char *path = strip(p);
+        char *desc = "";
+        for (p = path; *p && *p != ' ' && *p != '\t'; p++)
+            ;
+        if (*p) {
+            *p++ = '\0';
+            desc = strip(p);
+        }
+        const char *file = strrchr(path, '/');
+        file = file ? file + 1 : path;
+        char pname[PKG_NAME_MAX], pversion[PKG_VERSION_MAX];
+        if (!valid_name(name) || !*path || path[0] == '/' || strstr(path, "..") || strstr(path, "://") ||
+            parse_asset(file, pname, sizeof(pname), pversion, sizeof(pversion)) < 0 || strcmp(pname, name) != 0) {
+            if (!shown)
+                printf("\n");
+            shown = 1;
+            warn("%s:%d: bad entry, ignored", REPOSITORY_FILE, lineno);
+            continue;
+        }
+        int dup = 0;
+        for (int w = 0; w < sync_written_count; w++)
+            if (!strcmp(sync_written[w], name))
+                dup = 1;
+        if (dup) {
+            if (!shown)
+                printf("\n");
+            shown = 1;
+            warn("%s:%d: package %s is listed twice, skipped", REPOSITORY_FILE, lineno, name);
+            continue;
+        }
+        struct found f;
+        memset(&f, 0, sizeof(f));
+        snprintf(f.name, sizeof(f.name), "%s", pname);
+        snprintf(f.version, sizeof(f.version), "%s", pversion);
+        snprintf(f.asset, sizeof(f.asset), "%s", file);
+        snprintf(f.desc, sizeof(f.desc), "%s", desc);
+        snprintf(f.url, sizeof(f.url), "%s%s", base, path);
+        snprintf(f.sig, sizeof(f.sig), "%s.sig", f.url);
+        write_src(&tsrc, &f);
+        if (sync_written_count < (int)(sizeof(sync_written) / sizeof(sync_written[0])))
+            snprintf(sync_written[sync_written_count++], PKG_NAME_MAX, "%s", pname);
+        printf("%s%s %s", shown++ ? ", " : "", pname, pversion);
+    }
+    if (rc == 0)
+        printf("%s\n", shown ? "" : "empty");
+    free(text);
     return 0;
 }
 
@@ -733,8 +860,12 @@ int sync_refresh(void)
         die("no repositories: set Registry in %s", keep_config[0] ? keep_config : rp("etc/pkg/pkg.conf"));
     if (locals_ignored)
         warn("%d repositories in [trusted] are ignored, set AllowLocalRepos = yes to use them", locals_ignored);
-    static char written[MAX_SOURCES * 4][PKG_NAME_MAX];
-    int written_count = 0;
+    sync_written_count = 0;
+    int trusted_fresh = 0;
+    if (sync_repository(&trusted_fresh) < 0)
+        failed++;
+    char trusted_repo[96] = "", trusted_base[PKG_PATH_MAX];
+    registry_where(trusted_base, sizeof(trusted_base), trusted_repo, sizeof(trusted_repo));
     int ok_repo[MAX_SOURCES] = {0};
     for (int i = 0; i < sources_total; i++) {
         const struct source *src = &sources[i];
@@ -756,8 +887,8 @@ int sync_refresh(void)
         int shown = 0;
         for (int k = 0; k < count; k++) {
             int dup = 0;
-            for (int w = 0; w < written_count; w++)
-                if (!strcmp(written[w], table[k].name))
+            for (int w = 0; w < sync_written_count; w++)
+                if (!strcmp(sync_written[w], table[k].name))
                     dup = 1;
             if (dup) {
                 printf("%s", shown ? "" : "\n");
@@ -766,8 +897,8 @@ int sync_refresh(void)
                 continue;
             }
             write_src(src, &table[k]);
-            if (written_count < (int)(sizeof(written) / sizeof(written[0])))
-                snprintf(written[written_count++], PKG_NAME_MAX, "%s", table[k].name);
+            if (sync_written_count < (int)(sizeof(sync_written) / sizeof(sync_written[0])))
+                snprintf(sync_written[sync_written_count++], PKG_NAME_MAX, "%s", table[k].name);
             printf("%s%s %s", shown++ ? ", " : "", table[k].name, table[k].version);
         }
         printf("%s\n", src->local ? "  (local)" : "");
@@ -783,10 +914,12 @@ int sync_refresh(void)
             snprintf(name, sizeof(name), "%.*s", (int)(n - 4), e->d_name);
             snprintf(path, sizeof(path), "%s/%s", rp("var/lib/pkg/sync"), e->d_name);
             int keep = 0;
-            for (int w = 0; w < written_count; w++)
-                if (!strcmp(written[w], name))
+            for (int w = 0; w < sync_written_count; w++)
+                if (!strcmp(sync_written[w], name))
                     keep = 1;
             if (!keep && src_field(path, "repo", repo, sizeof(repo)) == 0) {
+                if (!trusted_fresh && trusted_repo[0] && !strcasecmp(repo, trusted_repo))
+                    keep = 1;
                 for (int i = 0; i < sources_total; i++)
                     if (!strcasecmp(sources[i].owner_repo, repo) && !ok_repo[i])
                         keep = 1;
@@ -816,6 +949,11 @@ static void sync_add(const struct pkg_info *info, const struct sync_meta *meta)
 
 static int source_allowed(const char *owner_repo, int *local)
 {
+    char base[PKG_PATH_MAX], repo[96];
+    if (registry_where(base, sizeof(base), repo, sizeof(repo)) == 0 && !strcasecmp(repo, owner_repo)) {
+        *local = 0;
+        return 1;
+    }
     for (int i = 0; i < sources_total; i++)
         if (!strcasecmp(sources[i].owner_repo, owner_repo)) {
             *local = sources[i].local;
@@ -992,6 +1130,13 @@ int fetch_package(int index, char *out_path, size_t cap)
 void list_sources(void)
 {
     printf("Registry: %s\n", registry[0] ? registry : "(none)");
+    char tbase[PKG_PATH_MAX], trepo[96];
+    if (registry_where(tbase, sizeof(tbase), trepo, sizeof(trepo)) == 0) {
+        printf(REPOSITORY_FILE "\n");
+        for (int k = 0; k < sdb.count; k++)
+            if (!strcasecmp(sdb.meta[k].repo, trepo))
+                printf("    %-24s %s\n", sdb.pkgs[k].name, sdb.pkgs[k].version);
+    }
     for (int i = 0; i < sources_total; i++) {
         printf("%s%s\n", sources[i].url, sources[i].local ? "  (local)" : "");
         for (int k = 0; k < sdb.count; k++)

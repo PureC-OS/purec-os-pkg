@@ -64,5 +64,33 @@ rm -rf "$T/api/repos/me/libfoo"
 $P -Sy > $T/sy3.log 2>&1; rc=$?
 check "unreachable repo keeps old entries" "[ $rc -ne 0 ] && test -f $ROOT/var/lib/pkg/sync/libfoo.src"
 check "upgrade continues" "$P -Syu > $T/up.log 2>&1; grep -q 'continuing with the others' $T/up.log"
+mk tpkg 1.2-1; mk tdup 1.0-1
+mkdir -p $T/bin/tpkg $T/bin/tdup
+cp $REL/tpkg-1.2-1-x86_64.pkg.tar.gz $T/bin/tpkg/
+cp $REL/tdup-1.0-1-x86_64.pkg.tar.gz $T/bin/tdup/
+cat > $T/repository.conf <<R
+# packages stored in the registry repository
+tpkg bin/tpkg/tpkg-1.2-1-x86_64.pkg.tar.gz Trusted test package
+tdup bin/tdup/tdup-1.0-1-x86_64.pkg.tar.gz
+tdup bin/tdup/tdup-1.0-1-x86_64.pkg.tar.gz
+wrong bin/tpkg/tpkg-1.2-1-x86_64.pkg.tar.gz
+evil ../../etc/evil-1.0-1-x86_64.pkg.tar.gz
+foo bin/tpkg/tpkg-1.2-1-x86_64.pkg.tar.gz
+R
+$P -Sy > $T/sy4.log 2>&1
+check "repository.conf lists packages" "grep -q 'tpkg 1.2-1' $T/sy4.log && grep -q 'tdup 1.0-1' $T/sy4.log"
+check "repository.conf bad entries ignored" "grep -q 'repository.conf:6' $T/sy4.log && ! test -f $ROOT/var/lib/pkg/sync/wrong.src && ! test -f $ROOT/var/lib/pkg/sync/evil.src"
+check "repository.conf duplicate skipped" "grep -q 'tdup is listed twice' $T/sy4.log"
+check "package from repository.conf wins" "grep -q 'repo=registry' $ROOT/var/lib/pkg/sync/tpkg.src && grep -q 'url=file://$T/bin/tpkg/' $ROOT/var/lib/pkg/sync/tpkg.src"
+check "install from repository.conf" "$P -S tpkg >/dev/null 2>&1 && test -f $ROOT/usr/share/tpkg.txt"
+check "-Sl shows repository.conf" "$P -Sl 2>&1 | grep -A3 '^repository.conf' | grep -q 'tpkg'"
+sed -i '/^tdup/d' $T/repository.conf
+$P -Sy >/dev/null 2>&1
+check "removed from repository.conf leaves sync" "! test -f $ROOT/var/lib/pkg/sync/tdup.src"
+sed 's/SigLevel = Never/SigLevel = Required/' $T/pkg.conf > $T/pkg-req.conf
+check "Required refuses unsigned repository.conf" "! $PKG --root $ROOT --config $T/pkg-req.conf --noconfirm -Sy >/dev/null 2>&1"
+rm -f $T/repository.conf
+$P -Sy > $T/sy5.log 2>&1
+check "missing repository.conf keeps old entries" "grep -q 'not available' $T/sy5.log && test -f $ROOT/var/lib/pkg/sync/tpkg.src"
 echo "RESULT fails=$fail dir=$T"
 exit $fail
