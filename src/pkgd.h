@@ -62,6 +62,8 @@ struct sync_meta {
     char file[PKG_PATH_MAX];
     int complete;
     int local;
+    int community;
+    char signer[41];
 };
 
 struct syncdb {
@@ -93,4 +95,22 @@ int list_upgrades(int quiet);
 #define SIG_BAD (-1)
 #define SIG_NOKEYS (-2)
 
-int sig_verify_file(const char *file, const char *signature_file);
+#define SIG_SCOPE_OFFICIAL 0
+#define SIG_SCOPE_REPO 1
+#define SIG_SCOPE_LOCAL 2
+
+struct sig_scope {
+    int kind;
+    const char *repo;
+    const char *name;
+};
+
+int sig_verify_file(const char *file, const char *signature_file, const struct sig_scope *scope, char signer_fp[41]);
+int sig_fingerprint_file(const char *pub, char out[41]);
+void sig_configure(int threshold);
+int sig_keyring_mode(void);
+const char *sig_keyring_error(void);
+long sig_keyring_serial(void);
+int sig_keyring_install(const char *candidate, long *new_serial);
+int sig_is_revoked(const char *fp);
+void sig_warn_revoked_installed(void);

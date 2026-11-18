@@ -107,11 +107,77 @@ printf '[options]\nSigLevel = Required\nRegistry = file://%s/registry.conf\n' $T
 SP="$PKG --root $T/sroot --config $T/spkg.conf --noconfirm"
 check "embedded signature accepted with Required" "$SP -Sy > $T/ss1.log 2>&1 && grep -q 'signed 1.0-1' $T/ss1.log"
 check "embedded signature: no .sig file needed" "! test -f $T/sreg/repository.conf.sig && ! test -f $T/sreg/registry.conf.sig"
+check "legacy mode warns about unbound keys" "grep -q 'not bound to repositories' $T/ss1.log"
 check "signed package installs" "$SP -S signed >/dev/null 2>&1 && test -f $T/sroot/usr/share/signed.txt"
 sed -i 's/^signed /signed2 /' $T/sreg/repository.conf
 check "tampered repository.conf refused" "! $SP -Sy > $T/ss2.log 2>&1 && grep -q 'signature is invalid' $T/ss2.log"
 rm -f $T/sreg/repository.conf
 printf 'signed bin/signed/signed-1.0-1-x86_64.pkg.tar.gz\n' > $T/sreg/repository.conf
 check "unsigned repository.conf refused with Required" "! $SP -Sy > $T/ss3.log 2>&1 && grep -q 'no signature' $T/ss3.log"
+
+PS="python3 $MK/pkgsign.py"
+KD=$T/kr; mkdir -p $KD $T/kroot/etc/pkg/keys/master $T/kreg $T/kapi $T/crel
+$PS genkey $KD/o.pem $KD/o.pub >/dev/null 2>&1
+$PS genkey $KD/c.pem $KD/c.pub >/dev/null 2>&1
+$PS genkey $KD/x.pem $KD/x.pub >/dev/null 2>&1
+$PS genkey $KD/m1.pem $KD/m1.pub >/dev/null 2>&1
+$PS genkey $KD/m2.pem $KD/m2.pub >/dev/null 2>&1
+FPO=$($PS fingerprint $KD/o.pub); FPC=$($PS fingerprint $KD/c.pub)
+cp $KD/m1.pub $T/kroot/etc/pkg/keys/master/m1.pub
+cp $KD/o.pub $T/kroot/etc/pkg/keys/official.pub
+signpkg() { python3 $MK/pkgsign.py sign $1 $REL/$2-x86_64.pkg.tar.gz $REL/$2-x86_64.pkg.tar.gz.sig; }
+mk offpkg 1.0-1; mk rogue 1.0-1; mk ctool 1.0-1; mk other 1.0-1; mk offpkg 2.0-1
+mv $REL/offpkg-2.0-1-x86_64.pkg.tar.gz $REL/offpkg-2.0-1-x86_64.pkg.tar.gz
+signpkg $KD/o.pem offpkg-1.0-1; signpkg $KD/x.pem rogue-1.0-1
+signpkg $KD/c.pem ctool-1.0-1; signpkg $KD/c.pem other-1.0-1; signpkg $KD/c.pem offpkg-2.0-1
+$GH com/tools v1 $REL/ctool-1.0-1-x86_64.pkg.tar.gz $REL/ctool-1.0-1-x86_64.pkg.tar.gz.sig $REL/other-1.0-1-x86_64.pkg.tar.gz $REL/other-1.0-1-x86_64.pkg.tar.gz.sig $REL/offpkg-2.0-1-x86_64.pkg.tar.gz $REL/offpkg-2.0-1-x86_64.pkg.tar.gz.sig
+mkdir -p $T/kapi; cp -r $T/api/repos $T/kapi/
+printf '# registry\ncommunity https://github.com/com/tools\n' > $T/kreg/registry.conf
+python3 $MK/publish.py --registry $T/kreg --key $KD/o.pem $REL/offpkg-1.0-1-x86_64.pkg.tar.gz $REL/rogue-1.0-1-x86_64.pkg.tar.gz >/dev/null 2>&1
+mkkr() {
+    { echo "# keyring"; echo "serial $1"; $PS keyring-entry $KD/o.pub official
+      $PS keyring-entry $KD/c.pub repo=https://github.com/Com/Tools.git names='ctool*,offpkg'; shift; for l in "$@"; do echo "$l"; done; } > $T/kreg/keyring.conf
+    $PS keyring-sign --key $KD/m1.pem $T/kreg/keyring.conf >/dev/null
+}
+mkkr 1
+printf '[options]\nSigLevel = Required\nAllowCommunity = yes\nAPI = file://%s/kapi\nRegistry = file://%s/kreg/registry.conf\n' $T $T > $T/kpkg.conf
+KP="$PKG --root $T/kroot --config $T/kpkg.conf --noconfirm"
+$KP -Sy > $T/k1.log 2>&1
+check "keyring accepted on refresh" "grep -q 'keyring.conf *serial 1' $T/k1.log && test -f $T/kroot/etc/pkg/keyring.conf"
+check "keyring-verify tool" "$PS keyring-verify --masters $KD/ $T/kreg/keyring.conf >/dev/null 2>&1 || { mkdir -p $T/mdir; cp $KD/m1.pub $T/mdir/; $PS keyring-verify --masters $T/mdir $T/kreg/keyring.conf >/dev/null; }"
+check "community listed and marked" "$KP -Ss ctool 2>&1 | grep -q 'ctool 1.0-1 \[community\]' && $KP -Si ctool 2>&1 | grep -q 'community, third-party'"
+check "official package accepted with keyring" "$KP -S offpkg > $T/k2.log 2>&1 && test -f $T/kroot/usr/share/offpkg.txt"
+check "signer and origin recorded" "$KP -Qi offpkg 2>&1 | grep -q \"Signed by *: $FPO\" && $KP -Qi offpkg 2>&1 | grep -q 'Origin *: official'"
+check "community name shadowing official dropped" "grep -q 'community package offpkg has the name of an official package' $T/k1.log && grep -q 'repo=registry' $T/kroot/var/lib/pkg/sync/offpkg.src"
+check "key outside the keyring rejected" "! $KP -S rogue > $T/k3.log 2>&1 && grep -q 'not trusted' $T/k3.log && ! test -f $T/kroot/usr/share/rogue.txt"
+check "community key accepted for its repo and names" "$KP -S ctool > $T/k4.log 2>&1 && test -f $T/kroot/usr/share/ctool.txt && grep -q 'community package' $T/k4.log"
+check "community signer recorded" "$KP -Qi ctool 2>&1 | grep -q \"Signed by *: $FPC\" && $KP -Qi ctool 2>&1 | grep -q 'Origin *: community'"
+check "community key refused outside its names" "! $KP -S other > $T/k5.log 2>&1 && grep -q 'no trusted key' $T/k5.log && ! test -f $T/kroot/usr/share/other.txt"
+printf '[options]\nSigLevel = Required\nAPI = file://%s/kapi\nRegistry = file://%s/kreg/registry.conf\n' $T $T > $T/kpkg-nc.conf
+$PKG --root $T/kroot --config $T/kpkg-nc.conf --noconfirm -Sy > $T/k6.log 2>&1
+check "AllowCommunity = no ignores community" "grep -q '1 community repositories are ignored' $T/k6.log && ! test -f $T/kroot/var/lib/pkg/sync/ctool.src"
+mkkr 1 "revoke $FPC test revocation"
+$KP -Sy > $T/k7.log 2>&1
+check "revoked key: installed package flagged" "grep -q 'signed with a revoked key: ctool' $T/k7.log && $KP -Qu 2>&1 | grep -q 'ctool 1.0-1 REVOKED'"
+check "revoked key rejected" "! $KP -S --force ctool >/dev/null 2>&1 && $KP -Qi ctool 2>&1 | grep -q '(REVOKED)'"
+mkkr 0
+$KP -Sy > $T/k8.log 2>&1
+check "keyring serial rollback rejected" "grep -q 'older than the installed' $T/k8.log && grep -q '^serial 1$' $T/kroot/etc/pkg/keyring.conf"
+cp $T/kroot/etc/pkg/keyring.conf $T/kreg/keyring.conf
+sed -i 's/^serial 1$/serial 7/' $T/kreg/keyring.conf
+$KP -Sy > $T/k9.log 2>&1
+check "tampered keyring refused" "grep -q 'valid master signature' $T/k9.log && grep -q '^serial 1$' $T/kroot/etc/pkg/keyring.conf"
+mkdir -p $T/kroot2/etc/pkg/keys/master $T/kreg2
+cp $KD/m1.pub $KD/m2.pub $T/kroot2/etc/pkg/keys/master/
+cp $T/kreg/registry.conf $T/kreg/repository.conf $T/kreg2/
+{ echo "serial 1"; $PS keyring-entry $KD/o.pub official; } > $T/kreg2/keyring.conf
+$PS keyring-sign --key $KD/m1.pem $T/kreg2/keyring.conf >/dev/null
+printf '[options]\nSigLevel = Required\nKeyringThreshold = 2\nAPI = file://%s/kapi\nRegistry = file://%s/kreg2/registry.conf\n' $T $T > $T/kpkg2.conf
+K2="$PKG --root $T/kroot2 --config $T/kpkg2.conf --noconfirm"
+$K2 -Sy > $T/k10.log 2>&1
+check "threshold 2 with one master signature refused" "grep -q '1 valid master signature(s), 2 required' $T/k10.log && ! test -f $T/kroot2/etc/pkg/keyring.conf"
+$PS keyring-sign --key $KD/m2.pem $T/kreg2/keyring.conf >/dev/null
+$K2 -Sy > $T/k11.log 2>&1
+check "threshold 2 with two master signatures accepted" "grep -q 'keyring.conf *serial 1' $T/k11.log && test -f $T/kroot2/etc/pkg/keyring.conf"
 echo "RESULT fails=$fail dir=$T"
 exit $fail

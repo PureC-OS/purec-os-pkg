@@ -68,8 +68,58 @@ CONFIGURATION
        **SigLevel** is **Never** (no check), **Optional** (the asset **name.pkg.tar.gz.sig** is
        checked when the release has one, a bad one is always refused) or **Required**.
        The signature is ECDSA P-256 over SHA-512 of the package; the public keys are
-       the files **/etc/pkg/keys/*.pub** (65 bytes, as hexadecimal text). Without a
-       signature a package is trusted because it comes from a trusted repository.
+       the files **/etc/pkg/keys/*.pub** (65 bytes, as hexadecimal text) until a keyring
+       exists (see KEYRING). Without a signature a package is trusted because it comes from
+       a trusted repository.
+
+       **AllowLocalRepos = yes** enables the **[trusted]** repositories (shown as local).
+       **AllowCommunity = yes** enables the **community** lines of **registry.conf** (default
+       no, they are counted and reported as ignored). **KeyringThreshold = N** is the number
+       of different master keys that must sign the keyring (default 1).
+
+KEYRING
+       Without **/etc/pkg/keyring.conf** every key in **/etc/pkg/keys/** is trusted for
+       everything (legacy mode, pkg warns once that keys are not bound to repositories).
+       With a keyring, a key is trusted only for what the keyring says. **keyring.conf**
+       is text:
+
+           serial 3
+           key FP HEXPOINT official
+           key FP HEXPOINT repo=https://github.com/owner/repo names=tool*,other
+           revoke FP reason
+           #sig MASTERFP HEXDER
+
+       **FP** is the fingerprint of a key: the first 20 bytes of SHA-512 over its 65-byte
+       point, in hexadecimal (40 characters; **pkgsign.py fingerprint**). The keyring is
+       valid when at least **KeyringThreshold** different master keys (files
+       **/etc/pkg/keys/master/*.pub**) made a **#sig** line, an ECDSA signature over every
+       byte above the first **#sig** line. A keyring that is not valid is never used; if the
+       installed one stops being valid nothing verifies.
+
+       **pkg -Sy** downloads **keyring.conf** next to **registry.conf** and installs it only
+       when it is valid and its **serial** is not lower than the installed one (a lower serial
+       is refused as a rollback, the old keyring stays). Revoked keys are never accepted.
+
+       Scopes: packages of official repositories, **registry.conf** and **repository.conf**
+       must be signed by a key marked **official**. A package of a community repository
+       must be signed by a key whose **repo** is that repository (case-insensitive,
+       trailing slash and **.git** ignored) and whose **names** (fnmatch patterns on the
+       package name) match the package. Packages of **[trusted]** repositories may also be
+       signed by keys in **/etc/pkg/keys/local/*.pub**. Community packages always need a
+       valid signature unless **SigLevel = Never**.
+
+COMMUNITY REPOSITORIES
+       **registry.conf** may contain lines **community https://github.com/owner/repo**.
+       They are used only with **AllowCommunity = yes**. A community package whose name is
+       the name of an official package (from official repositories or **repository.conf**)
+       is dropped with a warning, so official names are reserved. Community packages are
+       marked **community** in **-Ss**, **-Si** and **-Sl**, and a transaction that installs
+       or upgrades them prints a warning first.
+
+       The local database records the key that signed a package (**signer**) and its origin
+       (official, community or local); **-Si** and **-Qi** show them. When the keyring
+       revokes a key, pkg warns about installed packages signed by it, and **-Qu** lists
+       them marked **REVOKED**.
 
 PACKAGES
        Files listed in **backup** of a package are configuration files. When an upgrade
@@ -80,7 +130,7 @@ PACKAGES
        **post-install**, **post-upgrade**, **pre-remove**, **post-remove**.
 
 FILES
-       /etc/pkg/pkg.conf, /etc/pkg/keys/, /var/lib/pkg/local/, /var/lib/pkg/sync/,
+       /etc/pkg/pkg.conf, /etc/pkg/keys/, /etc/pkg/keys/master/, /etc/pkg/keys/local/, /etc/pkg/keyring.conf, /var/lib/pkg/local/, /var/lib/pkg/sync/,
        /var/cache/pkg/
 
 SEE ALSO

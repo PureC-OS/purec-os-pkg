@@ -37,6 +37,8 @@ struct pkg_info {
     long installdate;
     int reason;
     char dbdir[96];
+    char signer[41];
+    char origin[16];
 };
 
 struct pkg_entry {

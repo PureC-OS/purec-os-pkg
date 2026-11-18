@@ -17,16 +17,21 @@
 #define SIG_REQUIRED 2
 #define REGISTRY_FILE "registry.conf"
 #define REPOSITORY_FILE "repository.conf"
+#define KEYRING_FILE "keyring.conf"
 
 struct source {
     char url[PKG_PATH_MAX];
     char owner_repo[96];
     int local;
+    int community;
 };
 
 static struct source sources[MAX_SOURCES];
 static int sources_total;
 static int locals_ignored;
+static int community_ignored;
+static int allow_community;
+static int keyring_threshold = 1;
 static char arch[16] = "x86_64";
 static char api_base[PKG_PATH_MAX] = "https://api.github.com";
 static char registry[PKG_PATH_MAX];
@@ -111,7 +116,11 @@ static int valid_name(const char *name)
     return 1;
 }
 
-static int add_source(const char *url, int local, const char *where, int line)
+#define KIND_OFFICIAL 0
+#define KIND_LOCAL 1
+#define KIND_COMMUNITY 2
+
+static int add_source(const char *url, int kind, const char *where, int line)
 {
     char owner_repo[96];
     if (parse_github(url, owner_repo, sizeof(owner_repo)) < 0) {
@@ -129,7 +138,8 @@ static int add_source(const char *url, int local, const char *where, int line)
     memset(s, 0, sizeof(*s));
     snprintf(s->url, sizeof(s->url), "https://github.com/%s", owner_repo);
     snprintf(s->owner_repo, sizeof(s->owner_repo), "%s", owner_repo);
-    s->local = local;
+    s->local = kind == KIND_LOCAL;
+    s->community = kind == KIND_COMMUNITY;
     return 0;
 }
 
@@ -151,8 +161,16 @@ static void load_registry_file(const char *path)
             *eol = '\0';
         lineno++;
         char *s = strip(line);
-        if (*s && *s != '#')
-            add_source(value_of_line(s), 0, "registry", lineno);
+        if (*s && *s != '#') {
+            if (!strncmp(s, "community", 9) && (s[9] == ' ' || s[9] == '\t')) {
+                if (allow_community)
+                    add_source(strip(s + 9), KIND_COMMUNITY, "registry", lineno);
+                else
+                    community_ignored++;
+            } else {
+                add_source(value_of_line(s), KIND_OFFICIAL, "registry", lineno);
+            }
+        }
         line = eol ? eol + 1 : NULL;
     }
     free(text);
@@ -210,6 +228,10 @@ static int load_file(const char *path, int required)
                     snprintf(registry, sizeof(registry), "%s", value);
                 else if (!strcmp(key, "AllowLocalRepos"))
                     allow_local = yes(value);
+                else if (!strcmp(key, "AllowCommunity"))
+                    allow_community = yes(value);
+                else if (!strcmp(key, "KeyringThreshold"))
+                    keyring_threshold = atoi(value) < 1 ? 1 : atoi(value);
             } else if (section == TRUSTED) {
                 if (local_count < MAX_SOURCES) {
                     snprintf(locals[local_count], PKG_PATH_MAX, "%s", value_of_line(s));
@@ -229,12 +251,14 @@ static int load_file(const char *path, int required)
         api_base[--n] = '\0';
     char cache[PKG_PATH_MAX + 32];
     snprintf(cache, sizeof(cache), "%s/" REGISTRY_FILE, rp("var/lib/pkg/sync"));
+    sig_configure(keyring_threshold);
+    community_ignored = 0;
     if (registry[0])
         load_registry_file(cache);
     locals_ignored = 0;
     for (int i = 0; i < local_count; i++) {
         if (allow_local)
-            add_source(locals[i], 1, path, local_lines[i]);
+            add_source(locals[i], KIND_LOCAL, path, local_lines[i]);
         else
             locals_ignored++;
     }
@@ -247,6 +271,8 @@ void config_load(void)
     config_used[0] = '\0';
     registry[0] = '\0';
     allow_local = 0;
+    allow_community = 0;
+    keyring_threshold = 1;
     if (opt.config) {
         load_file(opt.config, 1);
         return;
@@ -669,7 +695,7 @@ static void write_src(const struct source *src, const struct found *f)
     int n = snprintf(body, sizeof(body),
                      "name=%s\nversion=%s\nrepo=%s\norigin=%s\ntag=%s\nasset=%s\nurl=%s\nsig=%s\nsize=%llu\n"
                      "desc=%s\n",
-                     f->name, f->version, src->owner_repo, src->local ? "local" : "registry", f->tag, f->asset,
+                     f->name, f->version, src->owner_repo, src->local ? "local" : src->community ? "community" : "registry", f->tag, f->asset,
                      f->url, f->sig, (unsigned long long)f->size, f->desc);
     if (n > 0 && (size_t)n < sizeof(body))
         write_text_file(path, body, (size_t)n);
@@ -716,8 +742,11 @@ static int hex_value(int c)
     return -1;
 }
 
+static const struct sig_scope official_scope = {SIG_SCOPE_OFFICIAL, NULL, NULL};
+
 static int verify_embedded(const char *path)
 {
+    char signer[41];
     size_t length = 0;
     char *text = read_text_file(path, &length);
     if (!text)
@@ -751,7 +780,7 @@ static int verify_embedded(const char *path)
             snprintf(payload, sizeof(payload), "%s.payload", path);
             snprintf(esig, sizeof(esig), "%s.esig", path);
             if (write_text_file(payload, text, start) == 0 && write_text_file(esig, der, der_len) == 0)
-                rc = sig_verify_file(payload, esig);
+                rc = sig_verify_file(payload, esig, &official_scope, signer);
             unlink(payload);
             unlink(esig);
         }
@@ -784,7 +813,8 @@ static int download_signed(const char *url, const char *dest, const char *label,
         if (embedded == 1) {
             have_sig = curl_get(sigurl, sig, 0, CURL_SILENT) == 0;
             if (have_sig) {
-                rc = sig_verify_file(fresh, sig);
+                char signer[41];
+                rc = sig_verify_file(fresh, sig, &official_scope, signer);
                 unlink(sig);
             }
         } else {
@@ -827,6 +857,37 @@ static int fetch_registry(void)
     if (download_signed(url, dest, "registry", 0) < 0)
         return -1;
     printf("done\n");
+    return 0;
+}
+
+static int fetch_keyring(void)
+{
+    char base[PKG_PATH_MAX], repo[96];
+    if (siglevel == SIG_NEVER || registry_where(base, sizeof(base), repo, sizeof(repo)) < 0)
+        return 0;
+    char url[PKG_PATH_MAX + 64], geturl[PKG_PATH_MAX + 96], dest[PKG_PATH_MAX + 48];
+    snprintf(url, sizeof(url), "%s" KEYRING_FILE, base);
+    fresh_url(url, 0, geturl, sizeof(geturl));
+    snprintf(dest, sizeof(dest), "%s/" KEYRING_FILE ".new", rp("var/lib/pkg/sync"));
+    printf(" %-36s ", KEYRING_FILE);
+    fflush(stdout);
+    if (curl_get(geturl, dest, 0, CURL_SILENT) < 0) {
+        unlink(dest);
+        printf("not available\n");
+        return 0;
+    }
+    long serial = 0;
+    int rc = sig_keyring_install(dest, &serial);
+    unlink(dest);
+    if (rc == 0) {
+        printf("serial %ld\n", serial);
+    } else if (rc == 1) {
+        printf("up to date\n");
+    } else {
+        printf("rejected\n");
+        warn("the keyring from the registry is refused (%s), keeping the installed one", sig_keyring_error());
+        return -1;
+    }
     return 0;
 }
 
@@ -926,7 +987,9 @@ int sync_refresh(void)
 {
     mkdirs(rp("var/lib/pkg/sync"), 0755);
     msg("Checking the registry and its repositories...");
-    int failed = fetch_registry() < 0;
+    int failed = fetch_keyring() < 0;
+    if (fetch_registry() < 0)
+        failed++;
     char keep_config[PKG_PATH_MAX];
     snprintf(keep_config, sizeof(keep_config), "%s", config_used);
     config_load();
@@ -934,6 +997,8 @@ int sync_refresh(void)
         die("no repositories: set Registry in %s", keep_config[0] ? keep_config : rp("etc/pkg/pkg.conf"));
     if (locals_ignored)
         warn("%d repositories in [trusted] are ignored, set AllowLocalRepos = yes to use them", locals_ignored);
+    if (community_ignored)
+        warn("%d community repositories are ignored, set AllowCommunity = yes to use them", community_ignored);
     sync_written_count = 0;
     int trusted_fresh = 0;
     if (sync_repository(&trusted_fresh) < 0)
@@ -941,8 +1006,14 @@ int sync_refresh(void)
     char trusted_repo[96] = "", trusted_base[PKG_PATH_MAX];
     registry_where(trusted_base, sizeof(trusted_base), trusted_repo, sizeof(trusted_repo));
     int ok_repo[MAX_SOURCES] = {0};
+    int official_count = -1;
+    for (int pass = 0; pass < 2; pass++)
     for (int i = 0; i < sources_total; i++) {
         const struct source *src = &sources[i];
+        if (src->community != pass)
+            continue;
+        if (pass == 1 && official_count < 0)
+            official_count = sync_written_count;
         struct found table[MAX_PER_REPO];
         int count = 0;
         char why[300];
@@ -960,14 +1031,18 @@ int sync_refresh(void)
         ok_repo[i] = 1;
         int shown = 0;
         for (int k = 0; k < count; k++) {
-            int dup = 0;
+            int dup = -1;
             for (int w = 0; w < sync_written_count; w++)
                 if (!strcmp(sync_written[w], table[k].name))
-                    dup = 1;
-            if (dup) {
+                    dup = w;
+            if (dup >= 0) {
                 printf("%s", shown ? "" : "\n");
-                warn("%s: package %s is already provided by an earlier repository, skipped", src->owner_repo,
-                     table[k].name);
+                if (src->community && dup < official_count)
+                    warn("%s: community package %s has the name of an official package, dropped", src->owner_repo,
+                         table[k].name);
+                else
+                    warn("%s: package %s is already provided by an earlier repository, skipped", src->owner_repo,
+                         table[k].name);
                 continue;
             }
             write_src(src, &table[k]);
@@ -975,7 +1050,7 @@ int sync_refresh(void)
                 snprintf(sync_written[sync_written_count++], PKG_NAME_MAX, "%s", table[k].name);
             printf("%s%s %s", shown++ ? ", " : "", table[k].name, table[k].version);
         }
-        printf("%s\n", src->local ? "  (local)" : "");
+        printf("%s\n", src->local ? "  (local)" : src->community ? "  (community)" : "");
     }
     DIR *d = opendir(rp("var/lib/pkg/sync"));
     if (d) {
@@ -1021,16 +1096,18 @@ static void sync_add(const struct pkg_info *info, const struct sync_meta *meta)
     sdb.count++;
 }
 
-static int source_allowed(const char *owner_repo, int *local)
+static int source_allowed(const char *owner_repo, int *local, int *community)
 {
     char base[PKG_PATH_MAX], repo[96];
     if (registry_where(base, sizeof(base), repo, sizeof(repo)) == 0 && !strcasecmp(repo, owner_repo)) {
         *local = 0;
+        *community = 0;
         return 1;
     }
     for (int i = 0; i < sources_total; i++)
         if (!strcasecmp(sources[i].owner_repo, owner_repo)) {
             *local = sources[i].local;
+            *community = sources[i].community;
             return 1;
         }
     return 0;
@@ -1088,11 +1165,13 @@ void syncdb_load(void)
             line = eol ? eol + 1 : NULL;
         }
         free(text);
-        int local = 0;
+        int local = 0, community = 0;
         if (!info.name[0] || !info.version[0] || !meta.url[0] || !info.filename[0] ||
-            !source_allowed(meta.repo, &local))
+            !source_allowed(meta.repo, &local, &community))
             continue;
         meta.local = local;
+        meta.community = community;
+        snprintf(info.origin, sizeof(info.origin), "%s", local ? "local" : community ? "community" : "official");
         snprintf(info.arch, sizeof(info.arch), "%s", arch);
         sync_add(&info, &meta);
     }
@@ -1114,8 +1193,8 @@ const char *package_for_url(const char *url, char *why, size_t cap)
         snprintf(why, cap, "%s is not a GitHub repository URL", url);
         return NULL;
     }
-    int local = 0;
-    if (!source_allowed(owner_repo, &local)) {
+    int local = 0, community = 0;
+    if (!source_allowed(owner_repo, &local, &community)) {
         snprintf(why, cap, "%s is not in the registry%s", owner_repo, allow_local ? " or in [trusted]" : "");
         return NULL;
     }
@@ -1135,12 +1214,14 @@ const char *package_for_url(const char *url, char *why, size_t cap)
     return NULL;
 }
 
-static int check_signature(const char *file, const struct sync_meta *m, int quiet)
+static int check_signature(const char *file, struct sync_meta *m, const char *name, int quiet)
 {
+    m->signer[0] = '\0';
     if (siglevel == SIG_NEVER)
         return 0;
+    int level = m->community ? SIG_REQUIRED : siglevel;
     if (!m->sig[0]) {
-        if (siglevel == SIG_REQUIRED) {
+        if (level == SIG_REQUIRED) {
             if (!quiet)
                 warn("%s: the release has no signature, SigLevel = Required", file);
             return -1;
@@ -1152,18 +1233,24 @@ static int check_signature(const char *file, const struct sync_meta *m, int quie
     if (!path_exists(sigfile) && curl_get(m->sig, sigfile, 0, 1) < 0) {
         if (!quiet)
             warn("cannot download the signature %s", m->sig);
-        return siglevel == SIG_REQUIRED ? -1 : 0;
+        return level == SIG_REQUIRED ? -1 : 0;
     }
-    int rc = sig_verify_file(file, sigfile);
+    char url[PKG_PATH_MAX];
+    snprintf(url, sizeof(url), "https://github.com/%s", m->repo);
+    struct sig_scope scope = {m->local ? SIG_SCOPE_LOCAL : m->community ? SIG_SCOPE_REPO : SIG_SCOPE_OFFICIAL, url,
+                              name};
+    int rc = sig_verify_file(file, sigfile, &scope, m->signer);
     if (rc == SIG_OK)
         return 0;
-    if (rc == SIG_NOKEYS && siglevel != SIG_REQUIRED) {
+    m->signer[0] = '\0';
+    if (rc == SIG_NOKEYS && level != SIG_REQUIRED) {
         if (!quiet)
             warn("signature not checked, no keys in %s", rp("etc/pkg/keys"));
         return 0;
     }
     if (!quiet)
-        warn("%s: %s", file, rc == SIG_BAD ? "signature is invalid" : "no trusted key to check the signature");
+        warn("%s: %s", file, rc == SIG_BAD ? "signature is invalid or the key is not trusted for this repository"
+                                           : "no trusted key to check the signature");
     unlink(sigfile);
     return -1;
 }
@@ -1171,20 +1258,20 @@ static int check_signature(const char *file, const struct sync_meta *m, int quie
 int fetch_package(int index, char *out_path, size_t cap)
 {
     const struct pkg_info *p = &sdb.pkgs[index];
-    const struct sync_meta *m = &sdb.meta[index];
+    struct sync_meta *m = &sdb.meta[index];
     if (!p->filename[0] || strchr(p->filename, '/'))
         return -1;
     mkdirs(rp("var/cache/pkg"), 0755);
     snprintf(out_path, cap, "%s/%s", rp("var/cache/pkg"), p->filename);
     struct stat st;
     if (stat(out_path, &st) == 0 && (!p->csize || (uint64_t)st.st_size == p->csize) &&
-        check_signature(out_path, m, 1) == 0)
+        check_signature(out_path, m, p->name, 1) == 0)
         return 0;
     unlink(out_path);
     char sigfile[PKG_PATH_MAX + 8];
     snprintf(sigfile, sizeof(sigfile), "%s.sig", out_path);
     unlink(sigfile);
-    printf(" %s (%s%s)\n", p->filename, m->repo, m->local ? ", local" : "");
+    printf(" %s (%s%s)\n", p->filename, m->repo, m->local ? ", local" : m->community ? ", community" : "");
     if (curl_get(m->url, out_path, 0, 0) < 0) {
         warn("download failed: %s", m->url);
         return -1;
@@ -1194,7 +1281,7 @@ int fetch_package(int index, char *out_path, size_t cap)
         unlink(out_path);
         return -1;
     }
-    if (check_signature(out_path, m, 0) < 0) {
+    if (check_signature(out_path, m, p->name, 0) < 0) {
         unlink(out_path);
         return -1;
     }
@@ -1212,11 +1299,13 @@ void list_sources(void)
                 printf("    %-24s %s\n", sdb.pkgs[k].name, sdb.pkgs[k].version);
     }
     for (int i = 0; i < sources_total; i++) {
-        printf("%s%s\n", sources[i].url, sources[i].local ? "  (local)" : "");
+        printf("%s%s\n", sources[i].url, sources[i].local ? "  (local)" : sources[i].community ? "  (community)" : "");
         for (int k = 0; k < sdb.count; k++)
             if (!strcasecmp(sdb.meta[k].repo, sources[i].owner_repo))
                 printf("    %-24s %s\n", sdb.pkgs[k].name, sdb.pkgs[k].version);
     }
     if (locals_ignored)
         printf("(%d repositories in [trusted] ignored: AllowLocalRepos is off)\n", locals_ignored);
+    if (community_ignored)
+        printf("(%d community repositories ignored: AllowCommunity is off)\n", community_ignored);
 }

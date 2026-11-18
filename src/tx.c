@@ -128,6 +128,8 @@ int sync_complete(int index)
         snprintf(scan.info.desc, sizeof(scan.info.desc), "%s", p->desc);
     hash_file(file, scan.info.sha512);
     *p = scan.info;
+    snprintf(p->signer, sizeof(p->signer), "%s", m->signer);
+    snprintf(p->origin, sizeof(p->origin), "%s", m->local ? "local" : m->community ? "community" : "official");
     snprintf(m->file, sizeof(m->file), "%s", file);
     m->complete = 1;
     return 0;
@@ -359,6 +361,8 @@ static int install_item(struct item *it)
     info.csize = it->info.csize;
     snprintf(info.filename, sizeof(info.filename), "%s", it->info.filename);
     snprintf(info.sha512, sizeof(info.sha512), "%s", it->info.sha512);
+    snprintf(info.signer, sizeof(info.signer), "%s", it->info.signer);
+    snprintf(info.origin, sizeof(info.origin), "%s", it->info.origin);
     info.reason = it->reason;
     info.installdate = (long)time(NULL);
 
@@ -533,6 +537,17 @@ static void print_plan(const struct plan *plan, const char *verb)
             download += it->info.csize;
         installed += it->info.size;
     }
+    int community = 0;
+    for (int i = 0; i < plan->count; i++)
+        if (plan->items[i].sync_index >= 0 && sdb.meta[plan->items[i].sync_index].community)
+            community++;
+    if (community) {
+        printf("\n");
+        warn("%d community package(s) from third-party repositories, not reviewed by PureC OS:", community);
+        for (int i = 0; i < plan->count; i++)
+            if (plan->items[i].sync_index >= 0 && sdb.meta[plan->items[i].sync_index].community)
+                warn("  %s from %s", plan->items[i].info.name, sdb.meta[plan->items[i].sync_index].repo);
+    }
     char a[32], b[32];
     human_size(download, a, sizeof(a));
     human_size(installed, b, sizeof(b));
@@ -558,6 +573,14 @@ static int run_plan(struct plan *plan, const char *question)
             continue;
         if (fetch_package(it->sync_index, it->file, sizeof(it->file)) < 0)
             die("failed to retrieve %s", it->info.name);
+    }
+    for (int i = 0; i < plan->count; i++) {
+        struct item *it = &plan->items[i];
+        if (it->sync_index < 0)
+            continue;
+        const struct sync_meta *m = &sdb.meta[it->sync_index];
+        snprintf(it->info.signer, sizeof(it->info.signer), "%s", m->signer);
+        snprintf(it->info.origin, sizeof(it->info.origin), "%s", m->local ? "local" : m->community ? "community" : "official");
     }
     msg("Checking for file conflicts...");
     int conflicts = 0;
@@ -658,6 +681,13 @@ int list_upgrades(int quiet)
             printf("%s %s -> %s\n", ldb.pkgs[i].name, ldb.pkgs[i].version, sdb.pkgs[s].version);
         n++;
     }
+    if (!quiet)
+        for (int i = 0; i < ldb.count; i++)
+            if (sig_is_revoked(ldb.pkgs[i].signer)) {
+                printf("%s %s REVOKED (signed by revoked key %s)\n", ldb.pkgs[i].name, ldb.pkgs[i].version,
+                       ldb.pkgs[i].signer);
+                n++;
+            }
     return n;
 }
 

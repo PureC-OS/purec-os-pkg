@@ -58,6 +58,10 @@ int pkg_info_parse(const char *text, struct pkg_info *out)
             set_text(out->filename, sizeof(out->filename), value);
         else if (!strcmp(key, "sha512"))
             set_text(out->sha512, sizeof(out->sha512), value);
+        else if (!strcmp(key, "signer"))
+            set_text(out->signer, sizeof(out->signer), value);
+        else if (!strcmp(key, "origin"))
+            set_text(out->origin, sizeof(out->origin), value);
         else if (!strcmp(key, "installdate"))
             out->installdate = strtol(value, NULL, 10);
         else if (!strcmp(key, "reason"))
@@ -144,6 +148,10 @@ int pkg_info_format(const struct pkg_info *info, char *out, size_t cap)
         EMIT("sha512 = %s\n", info->sha512);
     if (info->installdate)
         EMIT("installdate = %ld\nreason = %d\n", info->installdate, info->reason);
+    if (info->signer[0])
+        EMIT("signer = %s\n", info->signer);
+    if (info->origin[0])
+        EMIT("origin = %s\n", info->origin);
     for (int i = 0; i < info->depend_count; i++)
         EMIT("depend = %s\n", info->depends[i]);
     for (int i = 0; i < info->conflict_count; i++)

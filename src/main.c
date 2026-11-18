@@ -136,6 +136,12 @@ static void print_info(const struct pkg_info *p, const char *repo, int installed
         printf("Download Size   : %s\n", sz);
         printf("Repository      : %s\n", repo);
     }
+    if (p->origin[0])
+        printf("Origin          : %s\n", p->origin);
+    if (p->signer[0])
+        printf("Signed by       : %s%s\n", p->signer, sig_is_revoked(p->signer) ? " (REVOKED)" : "");
+    else if (installed)
+        printf("Signed by       : None\n");
     if (installed) {
         printf("Install Reason  : %s\n", p->reason == 1 ? "Installed as a dependency" : "Explicitly installed");
         char when[64] = "unknown";
@@ -152,8 +158,9 @@ static int op_query(int argc, char **targets, int flags_i, int flags_l, int flag
                     int flags_s, int flags_u, int flags_k, int quiet)
 {
     localdb_load();
+    config_load();
+    sig_warn_revoked_installed();
     if (flags_u) {
-        config_load();
         syncdb_load();
         list_upgrades(quiet);
         return 0;
@@ -393,7 +400,8 @@ int main(int argc, char **argv)
             for (int n = 0; n < sdb.count; n++)
                 for (int t = 0; t < ntargets; t++)
                     if (contains_icase(sdb.pkgs[n].name, targets[t]) || contains_icase(sdb.pkgs[n].desc, targets[t])) {
-                        printf("%s/%s %s\n    %s\n", sdb.meta[n].repo, sdb.pkgs[n].name, sdb.pkgs[n].version, sdb.pkgs[n].desc);
+                        printf("%s/%s %s%s\n    %s\n", sdb.meta[n].repo, sdb.pkgs[n].name, sdb.pkgs[n].version,
+                               sdb.meta[n].community ? " [community]" : "", sdb.pkgs[n].desc);
                         break;
                     }
         } else if (i) {
@@ -406,7 +414,8 @@ int main(int argc, char **argv)
                 {
                     char where[128];
                     snprintf(where, sizeof(where), "%s%s", sdb.meta[idx].repo,
-                             sdb.meta[idx].local ? " (local, not from the registry)" : "");
+                             sdb.meta[idx].local ? " (local, not from the registry)" :
+                             sdb.meta[idx].community ? " (community, third-party)" : "");
                     print_info(&sdb.pkgs[idx], where, 0);
                 }
                 }
@@ -427,8 +436,13 @@ int main(int argc, char **argv)
             if (ntargets || u)
                 warn("some trusted repositories could not be checked, continuing with the others");
         }
+        if (y && !ntargets && !u) {
+            localdb_load();
+            sig_warn_revoked_installed();
+        }
         if (ntargets || u) {
             localdb_load();
+            sig_warn_revoked_installed();
             syncdb_load();
             if (!sdb.count && u && !ntargets)
                 die("nothing is known about the trusted repositories yet, run 'pkg -Sy' first");
