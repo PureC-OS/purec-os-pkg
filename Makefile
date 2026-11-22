@@ -12,7 +12,7 @@ CRYPT_DIR := $(ROOT_DIR)/libxcrypt
 SOURCES := main util db repo json tx sig archive version info
 OBJECTS := $(SOURCES:%=$(OBJ)/%.o)
 LIBS := $(LIB_DIR)/libz.a $(LIB_DIR)/libwolf.a $(LIB_DIR)/libpurecrypt.a $(LIB_DIR)/libpurefs.a $(LIB_DIR)/libpurec.a
-CFLAGS := $(CPPFLAGS) -I$(ROOT_DIR)/src/libc/include/hosted -I$(CURDIR)/src -I$(CRYPT_DIR)/include \
+CFLAGS := $(CPPFLAGS) -I$(LIBC_DIR)/include/hosted -I$(CURDIR)/src -I$(CRYPT_DIR)/include \
 	-I$(ROOT_DIR)/netsurf-libs/zlib -I$(ROOT_DIR)/wolfssl -I$(ROOT_DIR)/wolfssl/purec \
 	-DWOLFSSL_USER_SETTINGS -DWOLF_PUREC_TLS -DPKG_VERSION_TEXT='"pkg $(VERSION)"' $(DEPFLAGS) $(USER_CFLAGS)
 PKG_FILE := $(OUT)/pkg-$(VERSION)-$(PKGREL)-x86_64.pkg.tar.gz
